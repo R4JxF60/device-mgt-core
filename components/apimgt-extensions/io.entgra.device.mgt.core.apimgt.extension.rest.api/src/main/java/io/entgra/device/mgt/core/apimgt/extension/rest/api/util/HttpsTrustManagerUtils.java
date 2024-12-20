@@ -33,6 +33,7 @@ import java.net.*;
 import java.security.*;
 import java.security.cert.CertificateException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -108,12 +109,16 @@ public class HttpsTrustManagerUtils {
         };
 
         if (isIgnoreHostnameVerification) {
+            SSLSocketFactory simpleSSLSocketFactory = getSimpleTrustedSSLSocketFactory();
+            if (simpleSSLSocketFactory == null) {
+                throw new IllegalStateException("Null received as the simple ssl socket factory");
+            }
             okHttpClient = new OkHttpClient.Builder()
                     .connectTimeout(TIMEOUT, TimeUnit.SECONDS)
                     .writeTimeout(TIMEOUT, TimeUnit.SECONDS)
                     .readTimeout(TIMEOUT, TimeUnit.SECONDS)
                     .connectionPool(new ConnectionPool(TIMEOUT, TIMEOUT, TimeUnit.SECONDS))
-                    .sslSocketFactory(getSimpleTrustedSSLSocketFactory(), trustAllCerts)
+                    .sslSocketFactory(simpleSSLSocketFactory, trustAllCerts)
                     .hostnameVerifier(new HostnameVerifier() {
                         @Override
                         public boolean verify(String s, SSLSession sslSession) {
@@ -123,13 +128,37 @@ public class HttpsTrustManagerUtils {
             return okHttpClient;
         } else {
             SSLSocketFactory trustedSSLSocketFactory = getTrustedSSLSocketFactory();
-            okHttpClient = new OkHttpClient.Builder()
+            if (trustedSSLSocketFactory == null) {
+                throw new IllegalStateException("Null received as the trusted ssl socket factory");
+            }
+            try {
+                TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+                trustManagerFactory.init(loadTrustStore(ServerConfiguration.getInstance().getFirstProperty(
+                        "Security.TrustStore.Location"), ServerConfiguration.getInstance().getFirstProperty(
+                        "Security.TrustStore.Password")));
+                TrustManager[] trustManagers = trustManagerFactory.getTrustManagers();
+
+                if (trustManagers.length != 1 || !(trustManagers[0] instanceof X509TrustManager)) {
+                    throw new IllegalStateException("Unexpected default trust managers:" + Arrays.toString(trustManagers));
+                }
+
+                okHttpClient = new OkHttpClient.Builder()
                     .connectTimeout(TIMEOUT, TimeUnit.SECONDS)
                     .writeTimeout(TIMEOUT, TimeUnit.SECONDS)
                     .readTimeout(TIMEOUT, TimeUnit.SECONDS)
                     .connectionPool(new ConnectionPool(TIMEOUT, TIMEOUT, TimeUnit.SECONDS))
-                    .sslSocketFactory(trustedSSLSocketFactory)
+                    .sslSocketFactory(trustedSSLSocketFactory, (X509TrustManager) trustManagers[0])
                     .proxySelector(proxySelector).build();
+            } catch (NoSuchAlgorithmException e) {
+                String msg = "Error encountered when initializing the trust manager factory with default algorithm : "
+                        + TrustManagerFactory.getDefaultAlgorithm();
+                log.error(msg, e);
+                throw new IllegalStateException(msg, e);
+            } catch (CertificateException | KeyStoreException | IOException e) {
+                String msg = "Error encountered while loading trust store";
+                log.error(msg, e);
+                throw new IllegalStateException(msg, e);
+            }
             return okHttpClient;
         }
     }
