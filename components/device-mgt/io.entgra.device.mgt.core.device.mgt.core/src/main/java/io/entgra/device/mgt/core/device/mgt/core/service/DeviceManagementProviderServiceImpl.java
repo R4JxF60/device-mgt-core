@@ -109,6 +109,7 @@ import io.entgra.device.mgt.core.device.mgt.common.exceptions.InvalidDeviceExcep
 import io.entgra.device.mgt.core.device.mgt.common.exceptions.TransactionManagementException;
 import io.entgra.device.mgt.core.device.mgt.common.exceptions.UnauthorizedDeviceAccessException;
 import io.entgra.device.mgt.core.device.mgt.common.exceptions.UserNotFoundException;
+import io.entgra.device.mgt.core.device.mgt.common.exceptions.MetadataKeyNotFoundException;
 import io.entgra.device.mgt.core.device.mgt.common.exceptions.MetadataManagementException;
 import io.entgra.device.mgt.core.device.mgt.common.geo.service.GeoQuery;
 import io.entgra.device.mgt.core.device.mgt.common.group.mgt.DeviceGroup;
@@ -3803,7 +3804,22 @@ public class DeviceManagementProviderServiceImpl implements DeviceManagementProv
         if (log.isDebugEnabled()) {
             log.debug("Unregister a device management service");
         }
+        boolean tenantFlowStarted = false;
         try {
+            // OSGi shutdown callbacks can run without a tenant context. Preserve an existing
+            // caller context; otherwise use the tenant that owns the provider.
+            if (PrivilegedCarbonContext.getThreadLocalCarbonContext().getTenantId() == -1) {
+                String tenantDomain = MultitenantConstants.SUPER_TENANT_DOMAIN_NAME;
+                if (!deviceManagementService.getProvisioningConfig().isSharedWithAllTenants()) {
+                    tenantDomain = deviceManagementService.getProvisioningConfig().getProviderTenantDomain();
+                }
+                int tenantId = DeviceManagerUtil.getTenantId(tenantDomain);
+                PrivilegedCarbonContext.startTenantFlow();
+                tenantFlowStarted = true;
+                PrivilegedCarbonContext context = PrivilegedCarbonContext.getThreadLocalCarbonContext();
+                context.setTenantId(tenantId);
+                context.setTenantDomain(tenantDomain);
+            }
             pluginRepository.removeDeviceManagementProvider(deviceManagementService);
         } catch (DeviceManagementException e) {
             log.error("Error occurred while un-registering device management plugin '" +
@@ -3811,6 +3827,10 @@ public class DeviceManagementProviderServiceImpl implements DeviceManagementProv
         } catch (Exception e) {
             String msg = "Error occurred in unregisterDeviceManagementService";
             log.error(msg, e);
+        } finally {
+            if (tenantFlowStarted) {
+                PrivilegedCarbonContext.endTenantFlow();
+            }
         }
     }
 
@@ -4048,8 +4068,20 @@ public class DeviceManagementProviderServiceImpl implements DeviceManagementProv
     private void addDeviceStatus(DeviceStatusManagementService deviceStatusManagementService, int tenantId,
                                  int updatedRows,EnrolmentInfo enrolmentInfo,String type)
             throws MetadataManagementException, DeviceManagementDAOException {
-        boolean isEnableDeviceStatusCheck = deviceStatusManagementService.getDeviceStatusCheck(tenantId);
-        boolean isValidState = deviceStatusManagementService.isDeviceStatusValid(type, enrolmentInfo.getStatus().name(), tenantId);
+        boolean isEnableDeviceStatusCheck;
+        boolean isValidState;
+        try {
+            isEnableDeviceStatusCheck = deviceStatusManagementService.getDeviceStatusCheck(tenantId);
+            isValidState = deviceStatusManagementService.isDeviceStatusValid(type, enrolmentInfo.getStatus().name(), tenantId);
+        } catch (MetadataKeyNotFoundException e) {
+            // Device status filter metadata has not been provisioned for this tenant yet, treat as disabled
+            if (log.isDebugEnabled()) {
+                log.debug("Device status filter metadata not found for tenant: " + tenantId
+                        + ", treating device status check as disabled", e);
+            }
+            isEnableDeviceStatusCheck = false;
+            isValidState = true;
+        }
         if (updatedRows == 1 && (!isEnableDeviceStatusCheck || isValidState)) {
             enrollmentDAO.addDeviceStatus(enrolmentInfo.getId(), enrolmentInfo.getStatus());
         }
